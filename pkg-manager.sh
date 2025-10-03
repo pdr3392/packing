@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# An interactive CLI to browse packages from pacman and yay using fzf.
+# An interactive CLI to browse and manage packages from pacman and yay using fzf.
 # Created for an Arch Linux system.
 
 # --- Colors for styling the output ---
@@ -18,6 +18,9 @@ _display_help_keys() {
   \033[0;32m?\033[0m        Toggle this help view
   \033[0;32mUp/Down\033[0m  Navigate packages (resets to info view)
   \033[0;32mEnter\033[0m    Select package to view details below
+  \033[0;32mu\033[0m        Update selected package
+  \033[0;32md\033[0m        Remove selected package
+  \033[0;32mr\033[0m        Reinstall selected package
   \033[0;32mESC\033[0m      Exit the application
 
   The preview pane on the right shows detailed
@@ -112,10 +115,10 @@ show_packages() {
     local RESET_PREVIEW_CMD="echo 'info' > '$PREVIEW_STATE_FILE'"
 
     # --- fzf invocation ---
-    # --header-lines=1 was removed to fix the first package being unselectable.
-    # New bindings for 'up' and 'down' were added to reset the preview from help.
-    local selection
-    selection=$(pacman -Qen | fzf \
+    # --expect is added to handle custom key presses for actions.
+    local fzf_output
+    fzf_output=$(pacman -Qen | fzf \
+        --expect=u,d,r \
         --header "$($HEADER_GEN_CMD)" \
         --height="90%" --layout=reverse --border=rounded --ansi \
         --preview "$DYNAMIC_PREVIEW_CMD" \
@@ -128,18 +131,65 @@ show_packages() {
 
     # --- Post-selection actions ---
     clear
-    if [ -n "$selection" ]; then
-        local package_name
-        package_name=$(echo "$selection" | awk '{print $1}')
 
-        echo -e "${GREEN}You selected:${NC} $package_name"
-        echo
-        echo "Full details:"
-        pacman -Qi "$package_name"
-        echo
-    else
-        echo "No package selected. Exiting."
+    # Exit if fzf was cancelled (e.g., via ESC)
+    if [ -z "$fzf_output" ]; then
+        echo "No action taken. Exiting."
+        return
     fi
+
+    local key
+    key=$(head -n1 <<< "$fzf_output")
+    local selection
+    selection=$(tail -n1 <<< "$fzf_output")
+    local package_name
+    package_name=$(echo "$selection" | cut -d' ' -f1)
+    local current_source
+    current_source=$(cat "$SOURCE_STATE_FILE")
+
+    # Check if a package was actually selected
+    if [ -z "$package_name" ]; then
+        echo "No package selected. Exiting."
+        return
+    fi
+
+    # Decide which command to use based on the source
+    local pkg_manager_cmd
+    if [[ "$current_source" == "yay" ]]; then
+        pkg_manager_cmd="yay"
+    else
+        pkg_manager_cmd="sudo pacman"
+    fi
+
+    # Handle the action based on the key pressed
+    case "$key" in
+        u|r)
+            if [[ "$key" == "u" ]]; then
+                echo -e "${GREEN}Attempting to update:${NC} $package_name"
+            else
+                echo -e "${GREEN}Attempting to reinstall:${NC} $package_name"
+            fi
+            $pkg_manager_cmd -S "$package_name"
+            ;;
+        d)
+            echo -e "${YELLOW}You are about to remove:${NC} $package_name"
+            read -p "Are you sure you want to proceed? [y/N] " -n 1 -r
+            echo # move to a new line
+            if [[ $REPLY =~ ^[Yy]$ ]]; then
+                echo "Removing package..."
+                $pkg_manager_cmd -Rns "$package_name"
+            else
+                echo "Removal cancelled."
+            fi
+            ;;
+        *) # This case handles the Enter key, where the 'key' is empty
+            echo -e "${GREEN}You selected:${NC} $package_name"
+            echo
+            echo "Full details:"
+            pacman -Qi "$package_name"
+            echo
+            ;;
+    esac
 }
 
 # --- Main execution ---
@@ -150,3 +200,5 @@ main() {
 
 # Run the main function
 main
+
+
