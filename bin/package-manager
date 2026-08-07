@@ -1,0 +1,1073 @@
+#!/usr/bin/env bash
+
+# Linux package manager helper.
+# Detects available package managers, lists installed packages, opens an fzf UI,
+# and exposes CLI actions for info/update/reinstall/remove/verify/fix.
+
+set -o pipefail
+
+APP_NAME="package-manager"
+VERSION="2.1.1"
+
+if [[ -t 1 ]]; then
+    BOLD='\033[1m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[1;33m'
+    RED='\033[0;31m'
+    BLUE='\033[0;34m'
+    NC='\033[0m'
+else
+    BOLD=''
+    GREEN=''
+    YELLOW=''
+    RED=''
+    BLUE=''
+    NC=''
+fi
+
+ASSUME_YES=false
+USE_CACHE=true
+REFRESH_CACHE=false
+CACHE_TTL="${PACKAGE_MANAGER_CACHE_TTL:-300}"
+
+trap 'exit 0' PIPE
+
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+with_timeout() {
+    local seconds
+    seconds="$1"
+    shift
+
+    if command_exists timeout; then
+        timeout "$seconds" "$@"
+    else
+        "$@"
+    fi
+}
+
+resolve_script_path() {
+    local source_path script_dir
+    source_path="${BASH_SOURCE[0]}"
+
+    if [[ "$source_path" != */* ]]; then
+        source_path=$(command -v -- "$source_path" || printf '%s' "$source_path")
+    fi
+
+    if command_exists readlink; then
+        source_path=$(readlink -f -- "$source_path" 2>/dev/null || printf '%s' "$source_path")
+    fi
+
+    script_dir=$(cd -- "$(dirname -- "$source_path")" && pwd -P) || return 1
+    printf '%s/%s\n' "$script_dir" "$(basename -- "$source_path")"
+}
+
+SCRIPT_PATH=$(resolve_script_path)
+PROJECT_ROOT=$(cd -- "$(dirname -- "$SCRIPT_PATH")/.." && pwd -P)
+
+if [[ -n "${PACKAGE_MANAGER_CACHE_DIR:-}" ]]; then
+    CACHE_DIR="$PACKAGE_MANAGER_CACHE_DIR"
+elif [[ -d "$PROJECT_ROOT/cache" ]]; then
+    CACHE_DIR="$PROJECT_ROOT/cache"
+else
+    CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/package-manager-cli"
+fi
+
+log() {
+    printf '%b%s%b\n' "$GREEN" "$*" "$NC"
+}
+
+warn() {
+    printf '%b%s%b\n' "$YELLOW" "$*" "$NC" >&2
+}
+
+error() {
+    printf '%b%s%b\n' "$RED" "$*" "$NC" >&2
+}
+
+die() {
+    error "$*"
+    exit 1
+}
+
+confirm() {
+    local prompt reply
+    prompt="$1"
+
+    if [[ "$ASSUME_YES" == true ]]; then
+        return 0
+    fi
+
+    read -r -n 1 -p "$prompt [y/N] " reply
+    printf '\n'
+    [[ "$reply" =~ ^[Yy]$ ]]
+}
+
+run_sudo() {
+    sudo "$@"
+}
+
+usage() {
+    cat <<'EOF'
+Usage:
+  package-manager.sh [interactive]
+  package-manager.sh managers
+  package-manager.sh list [manager|all]
+  package-manager.sh info <manager> <package>
+  package-manager.sh verify <manager> <package>
+  package-manager.sh fix <manager> <package>
+  package-manager.sh update <manager> <package>
+  package-manager.sh reinstall <manager> <package>
+  package-manager.sh remove [-y|--yes] <manager> <package>
+  package-manager.sh health [manager|all]
+  package-manager.sh cache status
+  package-manager.sh cache clear
+
+Examples:
+  ./package-manager.sh
+  ./package-manager.sh managers
+  ./package-manager.sh list flatpak
+  ./package-manager.sh --refresh list all
+  ./package-manager.sh verify pacman bash
+  ./package-manager.sh fix apt curl
+
+Cache:
+  --refresh              Rebuild package-list cache before reading it
+  --no-cache             Read package managers directly
+  --cache-ttl <seconds>  Cache TTL for package lists (default: 300)
+  PACKAGE_MANAGER_CACHE_DIR can override the cache directory.
+
+Interactive keys:
+  I      Show package details
+  U      Update/sync selected package
+  R      Reinstall selected package
+  D      Remove selected package
+  V      Verify package integrity when supported
+  F      Fix package by reinstalling/repairing when supported
+  ?      Toggle help preview
+  Esc    Exit
+EOF
+}
+
+display_help_keys() {
+    cat <<'EOF'
+GEN-MANAGER
+
+Navigation
+  Shift+Tab  Switch package manager
+  /          Search packages
+  Up/Down    Move selection
+  ?          Toggle this help view
+  Esc        Exit
+
+Package actions
+  Shift+I   Show package details
+  Shift+V   Verify integrity
+  Shift+F   Fix/reinstall or repair
+  Shift+U   Update/sync
+  Shift+R   Reinstall
+  Shift+D   Remove
+
+Only the selected package manager is shown at a time.
+EOF
+}
+
+manager_label() {
+    case "$1" in
+        pacman) printf 'pacman native packages' ;;
+        yay) printf 'yay foreign/AUR packages' ;;
+        flatpak) printf 'Flatpak apps/runtimes' ;;
+        snap) printf 'Snap packages' ;;
+        apt) printf 'APT/dpkg packages' ;;
+        dpkg) printf 'dpkg database packages' ;;
+        dnf) printf 'DNF/RPM packages' ;;
+        zypper) printf 'Zypper/RPM packages' ;;
+        rpm) printf 'RPM database packages' ;;
+        brew) printf 'Homebrew packages' ;;
+        emerge) printf 'Gentoo Portage packages' ;;
+        xbps) printf 'XBPS packages' ;;
+        nix-env) printf 'Nix user environment packages' ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+manager_available() {
+    case "$1" in
+        pacman) command_exists pacman ;;
+        yay) command_exists yay && command_exists pacman ;;
+        flatpak) command_exists flatpak ;;
+        snap) command_exists snap ;;
+        apt) command_exists apt-get && command_exists dpkg-query ;;
+        dpkg) command_exists dpkg-query && ! command_exists apt-get ;;
+        dnf) command_exists dnf && command_exists rpm ;;
+        zypper) command_exists zypper && command_exists rpm ;;
+        rpm) command_exists rpm && ! command_exists dnf && ! command_exists zypper ;;
+        brew) command_exists brew ;;
+        emerge) command_exists emerge ;;
+        xbps) command_exists xbps-query && command_exists xbps-install ;;
+        nix-env) command_exists nix-env ;;
+        *) return 1 ;;
+    esac
+}
+
+detect_managers() {
+    local candidates manager
+    candidates=(pacman yay flatpak snap apt dpkg dnf zypper rpm brew emerge xbps nix-env)
+
+    for manager in "${candidates[@]}"; do
+        if manager_available "$manager"; then
+            printf '%s\n' "$manager"
+        fi
+    done
+}
+
+ensure_manager() {
+    local manager
+    manager="$1"
+    manager_available "$manager" || die "Package manager not available: $manager"
+}
+
+manager_supports_verify() {
+    case "$1" in
+        pacman|yay|apt|dpkg|dnf|zypper|rpm|flatpak|brew) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+manager_supports_fix() {
+    case "$1" in
+        pacman|yay|apt|dnf|zypper|flatpak|brew) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+print_managers() {
+    local manager count
+    count=0
+
+    printf '%-10s  %s\n' "MANAGER" "DESCRIPTION"
+    printf '%-10s  %s\n' "-------" "-----------"
+
+    while IFS= read -r manager; do
+        count=$((count + 1))
+        printf '%-10s  %s\n' "$manager" "$(manager_label "$manager")"
+    done < <(detect_managers)
+
+    if (( count == 0 )); then
+        die "No supported package manager was detected."
+    fi
+}
+
+list_pacman() {
+    pacman -Qen 2>/dev/null | awk 'BEGIN { OFS="\t" } { print "pacman", $1, $2, "native explicit" }'
+}
+
+list_yay() {
+    yay -Qem 2>/dev/null | awk 'BEGIN { OFS="\t" } { print "yay", $1, $2, "foreign/AUR explicit" }'
+}
+
+list_flatpak() {
+    with_timeout 6s flatpak list --columns=application,version,origin 2>/dev/null |
+        awk -F '\t' 'BEGIN { OFS="\t" } { version=$2; source=$3; if (version == "") version="-"; if (source == "") source="flatpak"; print "flatpak", $1, version, source }'
+}
+
+list_snap() {
+    local output
+
+    if output=$(with_timeout 6s snap list 2>/dev/null) && [[ -n "$output" ]]; then
+        printf '%s\n' "$output" |
+            awk 'BEGIN { OFS="\t" } NR > 1 { source=$4; if (source == "") source="snap"; print "snap", $1, $2, source }'
+        return
+    fi
+
+    find /var/lib/snapd/snaps -maxdepth 1 -type f -name '*.snap' -printf '%f\n' 2>/dev/null |
+        sed 's/\.snap$//' |
+        awk -F '_' 'BEGIN { OFS="\t" } NF >= 2 { name=$1; rev=$NF; print name, rev }' |
+        sort -t $'\t' -k1,1 -k2,2n |
+        awk -F '\t' 'BEGIN { OFS="\t" } { latest[$1]=$2 } END { for (name in latest) print "snap", name, "rev " latest[name], "snap file fallback" }' |
+        sort -t $'\t' -k2,2
+}
+
+list_apt() {
+    dpkg-query -W -f='${binary:Package}\t${Version}\t${db:Status-Abbrev}\n' 2>/dev/null |
+        awk -F '\t' 'BEGIN { OFS="\t" } $3 ~ /^ii/ { print "apt", $1, $2, "dpkg installed" }'
+}
+
+list_dpkg() {
+    dpkg-query -W -f='${binary:Package}\t${Version}\t${db:Status-Abbrev}\n' 2>/dev/null |
+        awk -F '\t' 'BEGIN { OFS="\t" } $3 ~ /^ii/ { print "dpkg", $1, $2, "dpkg installed" }'
+}
+
+list_rpm_like() {
+    local manager
+    manager="$1"
+    with_timeout 8s rpm -qa --qf "${manager}\t%{NAME}\t%{VERSION}-%{RELEASE}\t%{VENDOR}\n" 2>/dev/null
+}
+
+list_dnf() {
+    if with_timeout 8s dnf repoquery --installed --qf '%{name}\t%{evr}\t%{repoid}' >/dev/null 2>&1; then
+        with_timeout 8s dnf repoquery --installed --qf '%{name}\t%{evr}\t%{repoid}' 2>/dev/null |
+            awk -F '\t' 'BEGIN { OFS="\t" } { source=$3; if (source == "") source="dnf installed"; print "dnf", $1, $2, source }'
+    else
+        list_rpm_like dnf
+    fi
+}
+
+list_zypper() {
+    list_rpm_like zypper
+}
+
+list_rpm() {
+    list_rpm_like rpm
+}
+
+list_brew() {
+    brew list --versions 2>/dev/null |
+        awk 'BEGIN { OFS="\t" } { name=$1; $1=""; sub(/^ /, ""); version=$0; if (version == "") version="-"; print "brew", name, version, "homebrew installed" }'
+}
+
+list_emerge() {
+    if command_exists qlist; then
+        qlist -Iv 2>/dev/null |
+            awk 'BEGIN { OFS="\t" } { print "emerge", $1, $2, "portage installed" }'
+    else
+        emerge --pretend --emptytree @world 2>/dev/null |
+            awk 'BEGIN { OFS="\t" } /^\[/ { print "emerge", $4, "-", "portage world" }'
+    fi
+}
+
+list_xbps() {
+    xbps-query -l 2>/dev/null |
+        awk 'BEGIN { OFS="\t" } $1 == "ii" { pkg=$2; version="-"; sub(/-[^-]+$/, "", pkg); if (pkg != $2) version=substr($2, length(pkg) + 2); print "xbps", pkg, version, "xbps installed" }'
+}
+
+list_nix_env() {
+    nix-env -q --installed 2>/dev/null |
+        awk 'BEGIN { OFS="\t" } { print "nix-env", $1, "-", "nix user env" }'
+}
+
+cache_file_for() {
+    local manager
+    manager="$1"
+    printf '%s/list-%s.tsv\n' "$CACHE_DIR" "$manager"
+}
+
+cache_is_fresh() {
+    local file now mtime age
+    file="$1"
+
+    [[ -s "$file" ]] || return 1
+    [[ "$REFRESH_CACHE" == false ]] || return 1
+
+    now=$(date +%s)
+    mtime=$(stat -c %Y "$file" 2>/dev/null) || return 1
+    age=$((now - mtime))
+    (( age <= CACHE_TTL ))
+}
+
+write_cache_file() {
+    local manager file tmp
+    manager="$1"
+    file=$(cache_file_for "$manager")
+    tmp="${file}.$$"
+
+    mkdir -p -- "$CACHE_DIR" || return 1
+    [[ -w "$CACHE_DIR" ]] || return 1
+    list_manager_uncached "$manager" > "$tmp"
+    if [[ ! -s "$tmp" ]]; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    mv -f -- "$tmp" "$file"
+}
+
+read_or_refresh_cache() {
+    local manager file
+    manager="$1"
+    file=$(cache_file_for "$manager")
+
+    if [[ "$USE_CACHE" == true ]] && cache_is_fresh "$file"; then
+        cat "$file"
+        return
+    fi
+
+    if [[ "$USE_CACHE" == true ]] && write_cache_file "$manager"; then
+        cat "$file"
+        return
+    fi
+
+    list_manager_uncached "$manager"
+}
+
+list_manager_uncached() {
+    local manager
+    manager="$1"
+    ensure_manager "$manager"
+
+    case "$manager" in
+        pacman) list_pacman ;;
+        yay) list_yay ;;
+        flatpak) list_flatpak ;;
+        snap) list_snap ;;
+        apt) list_apt ;;
+        dpkg) list_dpkg ;;
+        dnf) list_dnf ;;
+        zypper) list_zypper ;;
+        rpm) list_rpm ;;
+        brew) list_brew ;;
+        emerge) list_emerge ;;
+        xbps) list_xbps ;;
+        nix-env) list_nix_env ;;
+    esac
+}
+
+list_manager() {
+    local manager
+    manager="$1"
+    ensure_manager "$manager"
+    read_or_refresh_cache "$manager"
+}
+
+list_all_packages() {
+    local manager
+    while IFS= read -r manager; do
+        list_manager "$manager"
+    done < <(detect_managers)
+}
+
+list_manager_for_tui() {
+    local manager output status
+    manager="$1"
+
+    output=$(list_manager "$manager" 2>&1)
+    status=$?
+
+    if (( status != 0 )); then
+        printf '%s\t%s\t-\t%s\n' "$manager" "<error loading packages>" "$output"
+        return 0
+    fi
+
+    if [[ -z "$output" ]]; then
+        printf '%s\t%s\t-\tNo installed packages found or backend timed out\n' "$manager" "<no packages>"
+        return 0
+    fi
+
+    printf '%s\n' "$output"
+}
+
+cache_status() {
+    local file
+
+    printf 'Cache dir: %s\n' "$CACHE_DIR"
+    printf 'Cache ttl: %s seconds\n' "$CACHE_TTL"
+    printf 'Use cache: %s\n' "$USE_CACHE"
+
+    if [[ ! -d "$CACHE_DIR" ]]; then
+        printf 'Cache files: none\n'
+        return
+    fi
+
+    printf '\n%-24s  %-10s  %s\n' "FILE" "SIZE" "MODIFIED"
+    printf '%-24s  %-10s  %s\n' "----" "----" "--------"
+    while IFS= read -r file; do
+        printf '%-24s  %-10s  %s\n' \
+            "$(basename -- "$file")" \
+            "$(wc -c < "$file")" \
+            "$(date -r "$file" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || printf '-')"
+    done < <(find "$CACHE_DIR" -maxdepth 1 -type f -name 'list-*.tsv' 2>/dev/null | sort)
+}
+
+cache_clear() {
+    if [[ ! -d "$CACHE_DIR" ]]; then
+        log "Cache directory does not exist: $CACHE_DIR"
+        return
+    fi
+
+    find "$CACHE_DIR" -maxdepth 1 -type f -name 'list-*.tsv' -delete
+    log "Cache cleared: $CACHE_DIR"
+}
+
+manager_header() {
+    local current manager first
+    current="$1"
+    first=true
+
+    printf 'gen-manager  '
+    while IFS= read -r manager; do
+        if [[ "$first" == true ]]; then
+            first=false
+        else
+            printf ' '
+        fi
+
+        if [[ "$manager" == "$current" ]]; then
+            printf '[%s]' "$manager"
+        else
+            printf ' %s ' "$manager"
+        fi
+    done < <(detect_managers)
+
+    printf '\n'
+    printf 'Manager: %s - %s' "$current" "$(manager_label "$current")"
+}
+
+manager_header_from_state() {
+    local manager_state_file current
+    manager_state_file="$1"
+    current=$(cat "$manager_state_file" 2>/dev/null)
+    [[ -n "$current" ]] || current=$(detect_managers | head -n1)
+    manager_header "$current"
+}
+
+manager_prompt_from_state() {
+    local manager_state_file current
+    manager_state_file="$1"
+    current=$(cat "$manager_state_file" 2>/dev/null)
+    [[ -n "$current" ]] || current=$(detect_managers | head -n1)
+    printf '%s > ' "$current"
+}
+
+cycle_manager() {
+    local manager_state_file preview_state_file current managers count index next_index manager
+    manager_state_file="$1"
+    preview_state_file="$2"
+    current=$(cat "$manager_state_file" 2>/dev/null)
+
+    mapfile -t managers < <(detect_managers)
+    count="${#managers[@]}"
+    (( count > 0 )) || return 1
+
+    index=0
+    for manager in "${managers[@]}"; do
+        if [[ "$manager" == "$current" ]]; then
+            break
+        fi
+        index=$((index + 1))
+    done
+
+    if (( index >= count )); then
+        index=0
+    fi
+
+    next_index=$(((index + 1) % count))
+    manager="${managers[$next_index]}"
+
+    printf '%s\n' "$manager" > "$manager_state_file"
+    printf 'info\n' > "$preview_state_file"
+    list_manager_for_tui "$manager"
+}
+
+package_info() {
+    local manager package
+    manager="$1"
+    package="$2"
+    ensure_manager "$manager"
+
+    case "$manager" in
+        pacman|yay) pacman -Qi "$package" ;;
+        flatpak) flatpak info "$package" ;;
+        snap) with_timeout 6s snap info "$package" || printf 'Snap metadata unavailable for %s. snapd did not respond quickly.\n' "$package" ;;
+        apt|dpkg) dpkg-query -s "$package" ;;
+        dnf) dnf info installed "$package" 2>/dev/null || rpm -qi "$package" ;;
+        zypper) zypper info --installed-only "$package" 2>/dev/null || rpm -qi "$package" ;;
+        rpm) rpm -qi "$package" ;;
+        brew) brew info "$package" ;;
+        emerge) emerge --search "=$package" ;;
+        xbps) xbps-query "$package" ;;
+        nix-env) nix-env -q --description "$package" ;;
+        *) return 1 ;;
+    esac
+}
+
+package_update() {
+    local manager package
+    manager="$1"
+    package="$2"
+    ensure_manager "$manager"
+
+    case "$manager" in
+        pacman) run_sudo pacman -Syu --needed "$package" ;;
+        yay) yay -Syu --needed "$package" ;;
+        flatpak) flatpak update "$package" ;;
+        snap) run_sudo snap refresh "$package" ;;
+        apt)
+            run_sudo apt-get update
+            run_sudo apt-get install --only-upgrade "$package"
+            ;;
+        dnf) run_sudo dnf upgrade "$package" ;;
+        zypper) run_sudo zypper update "$package" ;;
+        brew) brew upgrade "$package" ;;
+        emerge) run_sudo emerge --update "$package" ;;
+        xbps) run_sudo xbps-install -Su "$package" ;;
+        nix-env) nix-env -u "$package" ;;
+        dpkg|rpm) die "$manager can list packages, but update requires apt/dnf/zypper or another higher-level manager." ;;
+        *) return 1 ;;
+    esac
+}
+
+package_reinstall() {
+    local manager package
+    manager="$1"
+    package="$2"
+    ensure_manager "$manager"
+
+    case "$manager" in
+        pacman) run_sudo pacman -S "$package" ;;
+        yay) yay -S "$package" ;;
+        flatpak) flatpak install --reinstall "$package" ;;
+        snap) run_sudo snap refresh --amend "$package" ;;
+        apt) run_sudo apt-get install --reinstall "$package" ;;
+        dnf) run_sudo dnf reinstall "$package" ;;
+        zypper) run_sudo zypper install --force "$package" ;;
+        brew) brew reinstall "$package" ;;
+        emerge) run_sudo emerge --oneshot "$package" ;;
+        xbps) run_sudo xbps-install -f "$package" ;;
+        dpkg|rpm|nix-env) die "$manager does not provide a safe generic reinstall command here." ;;
+        *) return 1 ;;
+    esac
+}
+
+package_remove() {
+    local manager package
+    manager="$1"
+    package="$2"
+    ensure_manager "$manager"
+
+    case "$manager" in
+        pacman) run_sudo pacman -Rns "$package" ;;
+        yay) yay -Rns "$package" ;;
+        flatpak) flatpak uninstall "$package" ;;
+        snap) run_sudo snap remove "$package" ;;
+        apt) run_sudo apt-get purge "$package" ;;
+        dpkg) run_sudo dpkg -r "$package" ;;
+        dnf) run_sudo dnf remove "$package" ;;
+        zypper) run_sudo zypper remove "$package" ;;
+        rpm) run_sudo rpm -e "$package" ;;
+        brew) brew uninstall "$package" ;;
+        emerge) run_sudo emerge --depclean "$package" ;;
+        xbps) run_sudo xbps-remove -R "$package" ;;
+        nix-env) nix-env -e "$package" ;;
+        *) return 1 ;;
+    esac
+}
+
+verify_ok() {
+    printf '%bOK:%b no integrity problems detected for %s/%s\n' "$GREEN" "$NC" "$1" "$2"
+}
+
+verify_problem() {
+    printf '%bProblems detected for %s/%s:%b\n' "$RED" "$1" "$2" "$NC"
+    printf '%s\n' "$3"
+}
+
+verify_unsupported() {
+    printf '%bVerification is not supported for %s in this script.%b\n' "$YELLOW" "$1" "$NC"
+    return 2
+}
+
+package_verify() {
+    local manager package output status
+    manager="$1"
+    package="$2"
+    ensure_manager "$manager"
+
+    case "$manager" in
+        pacman|yay)
+            output=$(pacman -Qk "$package" 2>&1)
+            status=$?
+            ;;
+        apt|dpkg)
+            if command_exists debsums; then
+                output=$(debsums -s "$package" 2>&1)
+                status=$?
+            else
+                output=$(dpkg --verify "$package" 2>&1)
+                status=$?
+            fi
+            ;;
+        dnf|zypper|rpm)
+            output=$(rpm -V "$package" 2>&1)
+            status=$?
+            ;;
+        flatpak)
+            output=$(flatpak repair --dry-run 2>&1)
+            status=$?
+            if (( status == 0 )) && [[ -z "$output" ]]; then
+                output="flatpak repair --dry-run did not report problems. This check is installation-wide, not package-specific."
+            fi
+            ;;
+        brew)
+            output=$(brew linkage --test "$package" 2>&1)
+            status=$?
+            ;;
+        *)
+            verify_unsupported "$manager"
+            return 2
+            ;;
+    esac
+
+    if (( status == 0 )); then
+        verify_ok "$manager" "$package"
+        [[ -n "$output" ]] && printf '%s\n' "$output"
+        return 0
+    fi
+
+    verify_problem "$manager" "$package" "$output"
+    return 1
+}
+
+package_fix() {
+    local manager package
+    manager="$1"
+    package="$2"
+    ensure_manager "$manager"
+
+    case "$manager" in
+        pacman|yay|apt|dnf|zypper|brew)
+            package_reinstall "$manager" "$package"
+            ;;
+        flatpak)
+            flatpak repair
+            ;;
+        *)
+            die "Fix is not supported for $manager in this script."
+            ;;
+    esac
+}
+
+print_action_header() {
+    local action manager package
+    action="$1"
+    manager="$2"
+    package="$3"
+    printf '%b%s%b %s/%s\n' "$BLUE" "$action" "$NC" "$manager" "$package"
+}
+
+run_action() {
+    local action manager package
+    action="$1"
+    manager="$2"
+    package="$3"
+
+    [[ -n "$manager" ]] || die "Missing package manager."
+    [[ -n "$package" ]] || die "Missing package name."
+
+    case "$action" in
+        info)
+            print_action_header "Info" "$manager" "$package"
+            package_info "$manager" "$package"
+            ;;
+        verify)
+            print_action_header "Verify" "$manager" "$package"
+            package_verify "$manager" "$package"
+            ;;
+        fix)
+            manager_supports_fix "$manager" || die "Fix is not supported for $manager."
+            print_action_header "Fix" "$manager" "$package"
+            package_fix "$manager" "$package"
+            ;;
+        update)
+            print_action_header "Update" "$manager" "$package"
+            package_update "$manager" "$package"
+            ;;
+        reinstall)
+            print_action_header "Reinstall" "$manager" "$package"
+            package_reinstall "$manager" "$package"
+            ;;
+        remove)
+            confirm "Remove $manager/$package?" || {
+                warn "Removal cancelled."
+                return 0
+            }
+            print_action_header "Remove" "$manager" "$package"
+            package_remove "$manager" "$package"
+            ;;
+        *)
+            die "Unknown action: $action"
+            ;;
+    esac
+}
+
+health_scan_manager() {
+    local manager package line output status found
+    manager="$1"
+    ensure_manager "$manager"
+
+    if ! manager_supports_verify "$manager"; then
+        warn "Skipping $manager: verification is not supported."
+        return 0
+    fi
+
+    if [[ "$manager" == "flatpak" ]]; then
+        package_verify flatpak all
+        return $?
+    fi
+
+    found=0
+    while IFS=$'\t' read -r _ package _ _; do
+        [[ -n "$package" ]] || continue
+        output=$(package_verify "$manager" "$package" 2>&1)
+        status=$?
+        if (( status == 1 )); then
+            found=$((found + 1))
+            printf '%bBROKEN%b %s/%s\n' "$RED" "$NC" "$manager" "$package"
+            printf '%s\n\n' "$output"
+        fi
+    done < <(list_manager "$manager")
+
+    if (( found == 0 )); then
+        printf '%bOK:%b no broken packages detected by %s checks.\n' "$GREEN" "$NC" "$manager"
+    fi
+}
+
+health_scan() {
+    local target manager
+    target="${1:-all}"
+
+    if [[ "$target" == "all" ]]; then
+        while IFS= read -r manager; do
+            printf '\n%b== %s ==%b\n' "$BOLD" "$manager" "$NC"
+            health_scan_manager "$manager"
+        done < <(detect_managers)
+    else
+        health_scan_manager "$target"
+    fi
+}
+
+preview_package() {
+    local state_file manager package state
+    state_file="$1"
+    manager="$2"
+    package="$3"
+    state="info"
+
+    {
+
+    if [[ -r "$state_file" ]]; then
+        state=$(cat "$state_file")
+    fi
+
+    if [[ "$state" == "help" ]]; then
+        display_help_keys
+        return
+    fi
+
+    printf '%b%s%b\n' "$BOLD" "$manager/$package" "$NC"
+    printf '%s\n' "$(manager_label "$manager")"
+    printf '%s\n\n' "----------------------------------------"
+
+    package_info "$manager" "$package" 2>&1 || true
+
+    printf '\n%s\n' "----------------------------------------"
+    if manager_supports_verify "$manager"; then
+        printf 'Integrity: Shift+V verify, Shift+F fix/reinstall.\n'
+    else
+        printf 'Integrity check: not supported for this manager.\n'
+    fi
+    } 2>/dev/null
+}
+
+interactive() {
+    local managers current_manager manager_state_file manager_state_arg header footer preview_state_file preview_state_arg script_path_arg toggle_help_cmd fzf_output
+    local key selection manager package version source
+
+    command_exists fzf || die "fzf is required for interactive mode. Install fzf or use CLI subcommands."
+
+    managers=$(detect_managers)
+    [[ -n "$managers" ]] || die "No supported package manager was detected."
+    current_manager=$(printf '%s\n' "$managers" | head -n1)
+
+    preview_state_file=$(mktemp)
+    manager_state_file=$(mktemp)
+    echo "info" > "$preview_state_file"
+    echo "$current_manager" > "$manager_state_file"
+    trap 'rm -f -- "$preview_state_file" "$manager_state_file"' EXIT
+
+    printf -v manager_state_arg '%q' "$manager_state_file"
+    printf -v preview_state_arg '%q' "$preview_state_file"
+    printf -v script_path_arg '%q' "$SCRIPT_PATH"
+
+    toggle_help_cmd="
+        if [ \"\$(cat $preview_state_arg)\" = 'info' ]; then
+            echo help > $preview_state_arg;
+        else
+            echo info > $preview_state_arg;
+        fi
+    "
+
+    while true; do
+        current_manager=$(cat "$manager_state_file")
+        header=$(manager_header "$current_manager")
+        footer="Shift+Tab manager | Shift+I details | Shift+V verify | Shift+F fix | Shift+U update | Shift+R reinstall | Shift+D remove | ? help | Esc exit"
+
+        fzf_output=$(list_manager "$current_manager" | fzf \
+            --delimiter=$'\t' \
+            --with-nth=2,3,4 \
+            --expect=I,U,D,R,V,F \
+            --header "$header" \
+            --header-first \
+            --border-label=" gen-manager " \
+            --list-label=" Packages " \
+            --preview-label=" Details " \
+            --input-label=" Filter " \
+            --footer "$footer" \
+            --footer-border=top \
+            --prompt "$current_manager > " \
+            --pointer=">" \
+            --marker="+" \
+            --info=inline-right \
+            --highlight-line \
+            --cycle \
+            --height="90%" --layout=reverse --border=rounded --ansi \
+            --preview "$script_path_arg --_preview $preview_state_arg {1} {2}" \
+            --preview-window=right:55%:border-left \
+            --bind "btab:reload($script_path_arg --_cycle-manager $manager_state_arg $preview_state_arg)+transform-header($script_path_arg --_manager-header $manager_state_arg)+transform-prompt($script_path_arg --_manager-prompt $manager_state_arg)" \
+            --bind "enter:ignore" \
+            --bind "?:execute($toggle_help_cmd)+refresh-preview")
+
+        clear
+
+        if [[ -z "$fzf_output" ]]; then
+            log "Exiting."
+            break
+        fi
+
+        key=$(head -n1 <<< "$fzf_output")
+        selection=$(tail -n1 <<< "$fzf_output")
+        IFS=$'\t' read -r manager package version source <<< "$selection"
+
+        if [[ -z "$manager" || -z "$package" ]]; then
+            warn "No package selected."
+            read -r -p "Press Enter to continue..."
+            continue
+        fi
+
+        if [[ "$package" == "<no packages>" || "$package" == "<error loading packages>" ]]; then
+            warn "No actionable package selected for $manager."
+            read -r -p "Press Enter to continue..."
+            continue
+        fi
+
+        case "$key" in
+            I) run_action info "$manager" "$package" ;;
+            U) run_action update "$manager" "$package" ;;
+            R) run_action reinstall "$manager" "$package" ;;
+            D) run_action remove "$manager" "$package" ;;
+            V) run_action verify "$manager" "$package" ;;
+            F)
+                confirm "Fix $manager/$package by reinstalling or repairing it?" &&
+                    run_action fix "$manager" "$package"
+                ;;
+        esac
+
+        printf '\n'
+        read -r -p "Press Enter to return to the package list..."
+    done
+}
+
+parse_global_flags() {
+    POSITIONAL_ARGS=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -y|--yes)
+                ASSUME_YES=true
+                shift
+                ;;
+            --refresh)
+                REFRESH_CACHE=true
+                shift
+                ;;
+            --no-cache)
+                USE_CACHE=false
+                shift
+                ;;
+            --cache-ttl)
+                [[ -n "${2:-}" ]] || die "Missing value for --cache-ttl."
+                CACHE_TTL="$2"
+                shift 2
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            --version)
+                printf '%s %s\n' "$APP_NAME" "$VERSION"
+                exit 0
+                ;;
+            *)
+                POSITIONAL_ARGS+=("$1")
+                shift
+                ;;
+        esac
+    done
+}
+
+main() {
+    local command target manager package
+    local -a POSITIONAL_ARGS
+
+    parse_global_flags "$@"
+    set -- "${POSITIONAL_ARGS[@]}"
+
+    command="${1:-interactive}"
+
+    case "$command" in
+        --_get_help)
+            display_help_keys
+            ;;
+        --_preview)
+            preview_package "$2" "$3" "$4"
+            ;;
+        --_manager-header)
+            manager_header_from_state "$2"
+            ;;
+        --_manager-prompt)
+            manager_prompt_from_state "$2"
+            ;;
+        --_cycle-manager)
+            cycle_manager "$2" "$3"
+            ;;
+        interactive|tui)
+            interactive
+            ;;
+        managers|detect)
+            print_managers
+            ;;
+        list|ls)
+            target="${2:-all}"
+            if [[ "$target" == "all" ]]; then
+                list_all_packages
+            else
+                list_manager "$target"
+            fi
+            ;;
+        info|verify|fix|update|reinstall|remove)
+            manager="$2"
+            package="$3"
+            run_action "$command" "$manager" "$package"
+            ;;
+        health|doctor)
+            target="${2:-all}"
+            health_scan "$target"
+            ;;
+        cache)
+            case "${2:-status}" in
+                status) cache_status ;;
+                clear) cache_clear ;;
+                *) die "Unknown cache command: ${2:-}" ;;
+            esac
+            ;;
+        help)
+            usage
+            ;;
+        *)
+            usage >&2
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
