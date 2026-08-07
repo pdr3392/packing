@@ -19,9 +19,23 @@ bin/package-manager list all
 bin/package-manager --refresh list pacman
 bin/package-manager verify pacman bash
 bin/package-manager fix pacman bash
+bin/package-manager --validate
 bin/package-manager cache status
 bin/package-manager cache clear
 ```
+
+## Validation
+
+Run a full non-interactive audit with:
+
+```bash
+gen-manager --validate
+```
+
+The validator checks detected package managers, required commands, direct
+backend output, TUI data source output, cache health, and backend-specific
+consistency. For `yay`, it compares `yay -Qem` with `pacman -Qqm` and uses the
+local `pacman -Qqm` foreign package database as the authoritative source.
 
 ## Cache
 

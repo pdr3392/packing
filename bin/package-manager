@@ -535,8 +535,9 @@ count_lines() {
 }
 
 validate_manager_specifics() {
-    local manager count
+    local manager count warnings_ref
     manager="$1"
+    warnings_ref="$2"
 
     case "$manager" in
         yay)
@@ -548,14 +549,17 @@ validate_manager_specifics() {
                 validate_status OK "$manager" "pacman foreign package database has $count package(s)."
             else
                 validate_status WARN "$manager" "yay is installed, but pacman -Qqm found no foreign/AUR packages. This is valid if you never installed AUR/foreign packages."
+                eval "$warnings_ref=\$(( $warnings_ref + 1 ))"
             fi
 
             if (( yay_count == count )); then
                 validate_status OK "$manager" "yay -Qem agrees with pacman -Qqm ($yay_count package(s))."
             elif (( yay_count == 0 && count > 0 )); then
                 validate_status WARN "$manager" "yay -Qem returned zero packages, but pacman -Qqm found $count. The CLI will use pacman -Qqm for this backend."
+                eval "$warnings_ref=\$(( $warnings_ref + 1 ))"
             else
                 validate_status WARN "$manager" "yay -Qem returned $yay_count package(s), while pacman -Qqm found $count. The CLI will use pacman -Qqm for consistency."
+                eval "$warnings_ref=\$(( $warnings_ref + 1 ))"
             fi
             ;;
         snap)
@@ -565,8 +569,10 @@ validate_manager_specifics() {
                 count=$(find /var/lib/snapd/snaps -maxdepth 1 -type f -name '*.snap' 2>/dev/null | count_lines)
                 if (( count > 0 )); then
                     validate_status WARN "$manager" "snap list did not respond quickly; using $count local .snap file(s) as fallback."
+                    eval "$warnings_ref=\$(( $warnings_ref + 1 ))"
                 else
                     validate_status WARN "$manager" "snap is installed, but snap list did not respond and no local snap files were found."
+                    eval "$warnings_ref=\$(( $warnings_ref + 1 ))"
                 fi
             fi
             ;;
@@ -591,7 +597,7 @@ validate_manager() {
         fi
     done < <(manager_required_commands "$manager")
 
-    validate_manager_specifics "$manager"
+    validate_manager_specifics "$manager" "$warnings_ref"
 
     output=$(USE_CACHE=false REFRESH_CACHE=false list_manager_uncached "$manager" 2>&1)
     status=$?
