@@ -24,6 +24,9 @@ bin/package-manager cache status
 bin/package-manager cache clear
 ```
 
+`gen-manager`, `bin/package-manager`, and `bash pkg-manager.sh` all execute the
+same CLI and therefore expose the same interface and arguments.
+
 ## Validation
 
 Run a full non-interactive audit with:
