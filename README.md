@@ -37,13 +37,14 @@ gen-manager --validate
 
 The validator checks detected package managers, required commands, direct
 backend output, TUI data source output, cache health, and backend-specific
-consistency. For `yay`, it compares `yay -Qem` with `pacman -Qqm` and uses the
-local `pacman -Qqm` foreign package database as the authoritative source.
+consistency. For `yay`, it uses `yay -Qem` as the primary source and verifies it
+against the equivalent `pacman -Qem` explicit foreign-package query.
 
 ## Cache
 
 Package listings are cached in `cache/` by default when running from this
-project directory. Override with:
+project directory. Cache filenames include a schema version so backend changes
+invalidate old data automatically. Override with:
 
 ```bash
 PACKAGE_MANAGER_CACHE_DIR=/tmp/pkg-cache bin/package-manager list all

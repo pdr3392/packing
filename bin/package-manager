@@ -7,7 +7,8 @@
 set -o pipefail
 
 APP_NAME="package-manager"
-VERSION="2.2.0"
+VERSION="2.3.0"
+CACHE_SCHEMA_VERSION="2"
 
 if [[ -t 1 ]]; then
     BOLD='\033[1m'
@@ -268,13 +269,16 @@ list_pacman() {
 }
 
 list_yay() {
-    local package version
+    local output
 
-    while IFS= read -r package; do
-        [[ -n "$package" ]] || continue
-        version=$(pacman -Q "$package" 2>/dev/null | awk '{ print $2 }')
-        printf 'yay\t%s\t%s\tforeign/AUR explicit\n' "$package" "${version:--}"
-    done < <(pacman -Qqm 2>/dev/null)
+    if output=$(yay -Qem 2>/dev/null) && [[ -n "$output" ]]; then
+        printf '%s\n' "$output" |
+            awk 'BEGIN { OFS="\t" } { print "yay", $1, $2, "foreign/AUR explicit" }'
+        return
+    fi
+
+    pacman -Qem 2>/dev/null |
+        awk 'BEGIN { OFS="\t" } { print "yay", $1, $2, "foreign/AUR explicit (pacman fallback)" }'
 }
 
 list_flatpak() {
@@ -360,7 +364,7 @@ list_nix_env() {
 cache_file_for() {
     local manager
     manager="$1"
-    printf '%s/list-%s.tsv\n' "$CACHE_DIR" "$manager"
+    printf '%s/list-v%s-%s.tsv\n' "$CACHE_DIR" "$CACHE_SCHEMA_VERSION" "$manager"
 }
 
 cache_is_fresh() {
@@ -535,31 +539,35 @@ count_lines() {
 }
 
 validate_manager_specifics() {
-    local manager count warnings_ref
+    local manager failures_ref warnings_ref
     manager="$1"
-    warnings_ref="$2"
+    failures_ref="$2"
+    warnings_ref="$3"
 
     case "$manager" in
         yay)
-            local yay_count
-            count=$(pacman -Qqm 2>/dev/null | count_lines)
-            yay_count=$(yay -Qem 2>/dev/null | count_lines)
+            local yay_output yay_status yay_count explicit_count foreign_count
+            yay_output=$(yay -Qem 2>&1)
+            yay_status=$?
+            yay_count=$(printf '%s\n' "$yay_output" | sed '/^$/d' | count_lines)
+            explicit_count=$(pacman -Qem 2>/dev/null | count_lines)
+            foreign_count=$(pacman -Qqm 2>/dev/null | count_lines)
 
-            if (( count > 0 )); then
-                validate_status OK "$manager" "pacman foreign package database has $count package(s)."
+            if (( yay_status != 0 )); then
+                validate_status FAIL "$manager" "yay -Qem failed: $yay_output"
+                eval "$failures_ref=\$(( $failures_ref + 1 ))"
+            elif (( yay_count != explicit_count )); then
+                validate_status FAIL "$manager" "yay -Qem returned $yay_count package(s), but pacman -Qem returned $explicit_count."
+                eval "$failures_ref=\$(( $failures_ref + 1 ))"
+            elif (( yay_count > 0 )); then
+                validate_status OK "$manager" "yay -Qem returned $yay_count explicit foreign/AUR package(s), matching pacman -Qem."
             else
-                validate_status WARN "$manager" "yay is installed, but pacman -Qqm found no foreign/AUR packages. This is valid if you never installed AUR/foreign packages."
+                validate_status WARN "$manager" "yay is installed, but yay -Qem and pacman -Qem found no explicit foreign/AUR packages."
                 eval "$warnings_ref=\$(( $warnings_ref + 1 ))"
             fi
 
-            if (( yay_count == count )); then
-                validate_status OK "$manager" "yay -Qem agrees with pacman -Qqm ($yay_count package(s))."
-            elif (( yay_count == 0 && count > 0 )); then
-                validate_status WARN "$manager" "yay -Qem returned zero packages, but pacman -Qqm found $count. The CLI will use pacman -Qqm for this backend."
-                eval "$warnings_ref=\$(( $warnings_ref + 1 ))"
-            else
-                validate_status WARN "$manager" "yay -Qem returned $yay_count package(s), while pacman -Qqm found $count. The CLI will use pacman -Qqm for consistency."
-                eval "$warnings_ref=\$(( $warnings_ref + 1 ))"
+            if (( foreign_count > explicit_count )); then
+                validate_status INFO "$manager" "pacman also reports $((foreign_count - explicit_count)) foreign dependency package(s), intentionally excluded from the explicit yay view."
             fi
             ;;
         snap)
@@ -597,7 +605,7 @@ validate_manager() {
         fi
     done < <(manager_required_commands "$manager")
 
-    validate_manager_specifics "$manager" "$warnings_ref"
+    validate_manager_specifics "$manager" "$failures_ref" "$warnings_ref"
 
     output=$(USE_CACHE=false REFRESH_CACHE=false list_manager_uncached "$manager" 2>&1)
     status=$?
@@ -638,7 +646,12 @@ validate_manager() {
     if [[ -e "$cache_file" ]]; then
         if [[ -s "$cache_file" ]]; then
             cache_count=$(sed '/^$/d' "$cache_file" | count_lines)
-            validate_status OK "$manager" "cache file exists with $cache_count row(s): $cache_file"
+            if cmp -s <(printf '%s\n' "$output") "$cache_file"; then
+                validate_status OK "$manager" "cache matches the direct backend with $cache_count row(s): $cache_file"
+            else
+                validate_status WARN "$manager" "cache differs from the direct backend ($cache_count cached, $count direct); use --refresh to rebuild it."
+                eval "$warnings_ref=\$(( $warnings_ref + 1 ))"
+            fi
         else
             validate_status FAIL "$manager" "cache file exists but is empty: $cache_file"
             eval "$failures_ref=\$(( $failures_ref + 1 ))"
@@ -713,28 +726,9 @@ manager_header() {
     printf 'Manager: %s - %s' "$current" "$(manager_label "$current")"
 }
 
-manager_header_from_state() {
-    local manager_state_file current
-    manager_state_file="$1"
-    current=$(cat "$manager_state_file" 2>/dev/null)
-    [[ -n "$current" ]] || current=$(detect_managers | head -n1)
-    manager_header "$current"
-}
-
-manager_prompt_from_state() {
-    local manager_state_file current
-    manager_state_file="$1"
-    current=$(cat "$manager_state_file" 2>/dev/null)
-    [[ -n "$current" ]] || current=$(detect_managers | head -n1)
-    printf '%s > ' "$current"
-}
-
-cycle_manager() {
-    local manager_state_file preview_state_file current managers count index next_index manager
-    manager_state_file="$1"
-    preview_state_file="$2"
-    current=$(cat "$manager_state_file" 2>/dev/null)
-
+next_manager() {
+    local current managers count index manager
+    current="$1"
     mapfile -t managers < <(detect_managers)
     count="${#managers[@]}"
     (( count > 0 )) || return 1
@@ -748,15 +742,10 @@ cycle_manager() {
     done
 
     if (( index >= count )); then
-        index=0
+        index=$((count - 1))
     fi
 
-    next_index=$(((index + 1) % count))
-    manager="${managers[$next_index]}"
-
-    printf '%s\n' "$manager" > "$manager_state_file"
-    printf 'info\n' > "$preview_state_file"
-    list_manager_for_tui "$manager"
+    printf '%s\n' "${managers[$(((index + 1) % count))]}"
 }
 
 package_info() {
@@ -1081,7 +1070,7 @@ preview_package() {
 }
 
 interactive() {
-    local managers current_manager manager_state_file manager_state_arg header footer preview_state_file preview_state_arg script_path_arg toggle_help_cmd fzf_output
+    local managers current_manager header footer preview_state_file preview_state_arg script_path_arg toggle_help_cmd fzf_output
     local key selection manager package version source
 
     command_exists fzf || die "fzf is required for interactive mode. Install fzf or use CLI subcommands."
@@ -1091,12 +1080,9 @@ interactive() {
     current_manager=$(printf '%s\n' "$managers" | head -n1)
 
     preview_state_file=$(mktemp)
-    manager_state_file=$(mktemp)
     echo "info" > "$preview_state_file"
-    echo "$current_manager" > "$manager_state_file"
-    trap 'rm -f -- "$preview_state_file" "$manager_state_file"' EXIT
+    trap 'rm -f -- "$preview_state_file"' EXIT
 
-    printf -v manager_state_arg '%q' "$manager_state_file"
     printf -v preview_state_arg '%q' "$preview_state_file"
     printf -v script_path_arg '%q' "$SCRIPT_PATH"
 
@@ -1109,14 +1095,13 @@ interactive() {
     "
 
     while true; do
-        current_manager=$(cat "$manager_state_file")
         header=$(manager_header "$current_manager")
         footer="Shift+Tab manager | Shift+I details | Shift+V verify | Shift+F fix | Shift+U update | Shift+R reinstall | Shift+D remove | ? help | Esc exit"
 
-        fzf_output=$(list_manager "$current_manager" | fzf \
+        fzf_output=$(list_manager_for_tui "$current_manager" | fzf \
             --delimiter=$'\t' \
             --with-nth=2,3,4 \
-            --expect=I,U,D,R,V,F \
+            --expect=btab,I,U,D,R,V,F \
             --header "$header" \
             --header-first \
             --border-label=" gen-manager " \
@@ -1134,7 +1119,6 @@ interactive() {
             --height="90%" --layout=reverse --border=rounded --ansi \
             --preview "$script_path_arg --_preview $preview_state_arg {1} {2}" \
             --preview-window=right:55%:border-left \
-            --bind "btab:reload($script_path_arg --_cycle-manager $manager_state_arg $preview_state_arg)+transform-header($script_path_arg --_manager-header $manager_state_arg)+transform-prompt($script_path_arg --_manager-prompt $manager_state_arg)" \
             --bind "enter:ignore" \
             --bind "?:execute($toggle_help_cmd)+refresh-preview")
 
@@ -1146,6 +1130,13 @@ interactive() {
         fi
 
         key=$(head -n1 <<< "$fzf_output")
+
+        if [[ "$key" == "btab" ]]; then
+            current_manager=$(next_manager "$current_manager")
+            printf 'info\n' > "$preview_state_file"
+            continue
+        fi
+
         selection=$(tail -n1 <<< "$fzf_output")
         IFS=$'\t' read -r manager package version source <<< "$selection"
 
@@ -1235,15 +1226,6 @@ main() {
             ;;
         --_preview)
             preview_package "$2" "$3" "$4"
-            ;;
-        --_manager-header)
-            manager_header_from_state "$2"
-            ;;
-        --_manager-prompt)
-            manager_prompt_from_state "$2"
-            ;;
-        --_cycle-manager)
-            cycle_manager "$2" "$3"
             ;;
         --_list-tui)
             list_manager_for_tui "$2"
