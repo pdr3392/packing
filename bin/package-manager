@@ -7,7 +7,7 @@
 set -o pipefail
 
 APP_NAME="package-manager"
-VERSION="2.1.1"
+VERSION="2.2.0"
 
 if [[ -t 1 ]]; then
     BOLD='\033[1m'
@@ -124,12 +124,14 @@ Usage:
   package-manager.sh health [manager|all]
   package-manager.sh cache status
   package-manager.sh cache clear
+  package-manager.sh --validate
 
 Examples:
   ./package-manager.sh
   ./package-manager.sh managers
   ./package-manager.sh list flatpak
   ./package-manager.sh --refresh list all
+  ./package-manager.sh --validate
   ./package-manager.sh verify pacman bash
   ./package-manager.sh fix apt curl
 
@@ -137,6 +139,7 @@ Cache:
   --refresh              Rebuild package-list cache before reading it
   --no-cache             Read package managers directly
   --cache-ttl <seconds>  Cache TTL for package lists (default: 300)
+  --validate             Audit detected managers, list backends, cache, and TUI data
   PACKAGE_MANAGER_CACHE_DIR can override the cache directory.
 
 Interactive keys:
@@ -265,7 +268,13 @@ list_pacman() {
 }
 
 list_yay() {
-    yay -Qem 2>/dev/null | awk 'BEGIN { OFS="\t" } { print "yay", $1, $2, "foreign/AUR explicit" }'
+    local package version
+
+    while IFS= read -r package; do
+        [[ -n "$package" ]] || continue
+        version=$(pacman -Q "$package" 2>/dev/null | awk '{ print $2 }')
+        printf 'yay\t%s\t%s\tforeign/AUR explicit\n' "$package" "${version:--}"
+    done < <(pacman -Qqm 2>/dev/null)
 }
 
 list_flatpak() {
@@ -487,6 +496,191 @@ cache_clear() {
 
     find "$CACHE_DIR" -maxdepth 1 -type f -name 'list-*.tsv' -delete
     log "Cache cleared: $CACHE_DIR"
+}
+
+validate_status() {
+    local level subject message
+    level="$1"
+    subject="$2"
+    message="$3"
+
+    case "$level" in
+        OK) printf '%bOK%b    %-10s %s\n' "$GREEN" "$NC" "$subject" "$message" ;;
+        WARN) printf '%bWARN%b  %-10s %s\n' "$YELLOW" "$NC" "$subject" "$message" ;;
+        FAIL) printf '%bFAIL%b  %-10s %s\n' "$RED" "$NC" "$subject" "$message" ;;
+        INFO) printf '%bINFO%b  %-10s %s\n' "$BLUE" "$NC" "$subject" "$message" ;;
+    esac
+}
+
+manager_required_commands() {
+    case "$1" in
+        pacman) printf 'pacman\n' ;;
+        yay) printf 'yay\npacman\n' ;;
+        flatpak) printf 'flatpak\n' ;;
+        snap) printf 'snap\n' ;;
+        apt) printf 'apt-get\ndpkg-query\n' ;;
+        dpkg) printf 'dpkg-query\n' ;;
+        dnf) printf 'dnf\nrpm\n' ;;
+        zypper) printf 'zypper\nrpm\n' ;;
+        rpm) printf 'rpm\n' ;;
+        brew) printf 'brew\n' ;;
+        emerge) printf 'emerge\n' ;;
+        xbps) printf 'xbps-query\nxbps-install\n' ;;
+        nix-env) printf 'nix-env\n' ;;
+    esac
+}
+
+count_lines() {
+    awk 'END { print NR + 0 }'
+}
+
+validate_manager_specifics() {
+    local manager count
+    manager="$1"
+
+    case "$manager" in
+        yay)
+            local yay_count
+            count=$(pacman -Qqm 2>/dev/null | count_lines)
+            yay_count=$(yay -Qem 2>/dev/null | count_lines)
+
+            if (( count > 0 )); then
+                validate_status OK "$manager" "pacman foreign package database has $count package(s)."
+            else
+                validate_status WARN "$manager" "yay is installed, but pacman -Qqm found no foreign/AUR packages. This is valid if you never installed AUR/foreign packages."
+            fi
+
+            if (( yay_count == count )); then
+                validate_status OK "$manager" "yay -Qem agrees with pacman -Qqm ($yay_count package(s))."
+            elif (( yay_count == 0 && count > 0 )); then
+                validate_status WARN "$manager" "yay -Qem returned zero packages, but pacman -Qqm found $count. The CLI will use pacman -Qqm for this backend."
+            else
+                validate_status WARN "$manager" "yay -Qem returned $yay_count package(s), while pacman -Qqm found $count. The CLI will use pacman -Qqm for consistency."
+            fi
+            ;;
+        snap)
+            if with_timeout 6s snap list >/dev/null 2>&1; then
+                validate_status OK "$manager" "snapd responded to snap list."
+            else
+                count=$(find /var/lib/snapd/snaps -maxdepth 1 -type f -name '*.snap' 2>/dev/null | count_lines)
+                if (( count > 0 )); then
+                    validate_status WARN "$manager" "snap list did not respond quickly; using $count local .snap file(s) as fallback."
+                else
+                    validate_status WARN "$manager" "snap is installed, but snap list did not respond and no local snap files were found."
+                fi
+            fi
+            ;;
+    esac
+}
+
+validate_manager() {
+    local manager cmd missing output status count tui_output tui_count cache_file cache_count failures_ref warnings_ref
+    manager="$1"
+    failures_ref="$2"
+    warnings_ref="$3"
+
+    validate_status INFO "$manager" "$(manager_label "$manager")"
+
+    while IFS= read -r cmd; do
+        [[ -n "$cmd" ]] || continue
+        if command_exists "$cmd"; then
+            validate_status OK "$manager" "command found: $cmd -> $(command -v "$cmd")"
+        else
+            validate_status FAIL "$manager" "required command missing: $cmd"
+            eval "$failures_ref=\$(( $failures_ref + 1 ))"
+        fi
+    done < <(manager_required_commands "$manager")
+
+    validate_manager_specifics "$manager"
+
+    output=$(USE_CACHE=false REFRESH_CACHE=false list_manager_uncached "$manager" 2>&1)
+    status=$?
+    count=$(printf '%s\n' "$output" | sed '/^$/d' | count_lines)
+
+    if (( status != 0 )); then
+        validate_status FAIL "$manager" "direct list backend failed: $output"
+        eval "$failures_ref=\$(( $failures_ref + 1 ))"
+        return
+    fi
+
+    if (( count == 0 )); then
+        validate_status WARN "$manager" "direct list backend returned zero packages."
+        eval "$warnings_ref=\$(( $warnings_ref + 1 ))"
+    else
+        validate_status OK "$manager" "direct list backend returned $count package(s)."
+    fi
+
+    tui_output=$(USE_CACHE=false REFRESH_CACHE=false list_manager_for_tui "$manager" 2>&1)
+    tui_count=$(printf '%s\n' "$tui_output" | sed '/^$/d' | count_lines)
+
+    if printf '%s\n' "$tui_output" | grep -q $'\t<no packages>\t'; then
+        if (( count == 0 )); then
+            validate_status WARN "$manager" "TUI source produced <no packages>; direct backend also returned zero rows."
+            eval "$warnings_ref=\$(( $warnings_ref + 1 ))"
+        else
+            validate_status FAIL "$manager" "TUI source produced <no packages>, but direct backend returned $count package(s)."
+            eval "$failures_ref=\$(( $failures_ref + 1 ))"
+        fi
+    elif printf '%s\n' "$tui_output" | grep -q $'\t<error loading packages>\t'; then
+        validate_status FAIL "$manager" "TUI source produced an error row: $tui_output"
+        eval "$failures_ref=\$(( $failures_ref + 1 ))"
+    else
+        validate_status OK "$manager" "TUI source returned $tui_count row(s)."
+    fi
+
+    cache_file=$(cache_file_for "$manager")
+    if [[ -e "$cache_file" ]]; then
+        if [[ -s "$cache_file" ]]; then
+            cache_count=$(sed '/^$/d' "$cache_file" | count_lines)
+            validate_status OK "$manager" "cache file exists with $cache_count row(s): $cache_file"
+        else
+            validate_status FAIL "$manager" "cache file exists but is empty: $cache_file"
+            eval "$failures_ref=\$(( $failures_ref + 1 ))"
+        fi
+    else
+        validate_status INFO "$manager" "no cache file yet; run gen-manager --refresh list $manager to create one."
+    fi
+}
+
+validate_app() {
+    local manager managers detected_count failures warnings
+    failures=0
+    warnings=0
+
+    printf '%bgen-manager validation%b\n' "$BOLD" "$NC"
+    printf 'Version: %s\n' "$VERSION"
+    printf 'Executable: %s\n' "$SCRIPT_PATH"
+    printf 'Project root: %s\n' "$PROJECT_ROOT"
+    printf 'Cache dir: %s\n\n' "$CACHE_DIR"
+
+    managers=$(detect_managers)
+    detected_count=$(printf '%s\n' "$managers" | sed '/^$/d' | count_lines)
+
+    if (( detected_count == 0 )); then
+        validate_status FAIL "global" "no supported package managers were detected."
+        return 1
+    fi
+
+    validate_status OK "global" "detected $detected_count package manager(s): $(printf '%s\n' "$managers" | paste -sd ',' -)"
+
+    while IFS= read -r manager; do
+        [[ -n "$manager" ]] || continue
+        printf '\n'
+        validate_manager "$manager" failures warnings
+    done <<< "$managers"
+
+    printf '\n'
+    if (( failures > 0 )); then
+        validate_status FAIL "summary" "$failures failure(s), $warnings warning(s)."
+        return 1
+    fi
+
+    if (( warnings > 0 )); then
+        validate_status WARN "summary" "0 failures, $warnings warning(s)."
+        return 0
+    fi
+
+    validate_status OK "summary" "no failures or warnings."
 }
 
 manager_header() {
@@ -854,6 +1048,17 @@ preview_package() {
         return
     fi
 
+    if [[ "$package" == "<no packages>" || "$package" == "<error loading packages>" ]]; then
+        printf '%b%s%b\n' "$BOLD" "$manager" "$NC"
+        printf '%s\n' "$(manager_label "$manager")"
+        printf '%s\n\n' "----------------------------------------"
+        printf '%s\n' "$package"
+        printf '%s\n' "No package metadata can be shown for this status row."
+        printf '\nTry Shift+Tab again or run:\n'
+        printf '  gen-manager --refresh list %s\n' "$manager"
+        return
+    fi
+
     printf '%b%s%b\n' "$BOLD" "$manager/$package" "$NC"
     printf '%s\n' "$(manager_label "$manager")"
     printf '%s\n\n' "----------------------------------------"
@@ -989,6 +1194,10 @@ parse_global_flags() {
                 CACHE_TTL="$2"
                 shift 2
                 ;;
+            --validate)
+                validate_app
+                exit $?
+                ;;
             -h|--help)
                 usage
                 exit 0
@@ -1029,6 +1238,9 @@ main() {
             ;;
         --_cycle-manager)
             cycle_manager "$2" "$3"
+            ;;
+        --_list-tui)
+            list_manager_for_tui "$2"
             ;;
         interactive|tui)
             interactive
